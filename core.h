@@ -427,6 +427,9 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
                            double min_occ,
                            bool generate_missing_h_cone) {
     std::string parent_name = get_cone_parent_atom(x_cra.residue->name, x_atom.name);
+    if (parent_name.empty()) {
+        parent_name = get_monomer_parent_atom(x_cra.residue->name, x_atom.name);
+    }
     if (parent_name.empty()) return;
 
     const gemmi::Atom* parent_atom = x_cra.residue->find_atom(parent_name, '*');
