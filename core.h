@@ -494,10 +494,8 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
                            int sym_op,
                            double min_occ,
                            bool generate_missing_h_cone) {
+    (void) generate_missing_h_cone;
     std::string parent_name = get_cone_parent_atom(x_cra.residue->name, x_atom.name);
-    if (parent_name.empty()) {
-        parent_name = get_monomer_parent_atom(x_cra.residue->name, x_atom.name);
-    }
     if (parent_name.empty()) return;
 
     const gemmi::Atom* parent_atom = x_cra.residue->find_atom(parent_name, '*');
@@ -516,8 +514,6 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
         h_candidates = generate_rotated_hydrogens(parent_atom->pos, x_pos, x_elem, env_coords, 2.0, 72);
     } else if (!orig_h_positions.empty()) {
         h_candidates = generate_wobbled_hydrogens(parent_atom->pos, x_pos, orig_h_positions, env_coords);
-    } else if (generate_missing_h_cone) {
-        h_candidates = generate_rotated_hydrogens(parent_atom->pos, x_pos, x_elem, env_coords, 2.0, 72);
     }
 
     double best_xh_angle = -1.0;

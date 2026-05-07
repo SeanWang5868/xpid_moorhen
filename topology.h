@@ -183,7 +183,6 @@ inline MonomerTopology build_monomer_topology(const std::string& res_upper,
         topology.atom_elements[gemmi::trim_str(atom.id)] = gemmi::to_upper(std::string(atom.el.name()));
     }
 
-    std::map<std::string, std::set<std::string>> all_bond_graph;
     std::map<std::string, std::set<std::string>> aromatic_bond_graph;
     std::unordered_map<std::string, std::vector<std::string>> bonded_h;
     std::unordered_map<std::string, std::vector<std::string>> heavy_neighbors;
@@ -202,8 +201,6 @@ inline MonomerTopology build_monomer_topology(const std::string& res_upper,
             heavy_neighbors[a1].push_back(a2);
             heavy_neighbors[a2].push_back(a1);
             if (is_ring_element(topology.atom_elements, a1) && is_ring_element(topology.atom_elements, a2)) {
-                all_bond_graph[a1].insert(a2);
-                all_bond_graph[a2].insert(a1);
                 if (bond.aromatic || bond.type == gemmi::BondType::Aromatic) {
                     aromatic_bond_graph[a1].insert(a2);
                     aromatic_bond_graph[a2].insert(a1);
@@ -224,35 +221,6 @@ inline MonomerTopology build_monomer_topology(const std::string& res_upper,
         topology.donors[item.first] = std::move(donor);
     }
 
-    for (const gemmi::Restraints::Plane& plane : cc.rt.planes) {
-        std::vector<std::string> atoms;
-        atoms.reserve(plane.ids.size());
-        for (const gemmi::Restraints::AtomId& atom_id : plane.ids) {
-            atoms.push_back(gemmi::trim_str(atom_id.atom));
-        }
-        add_ring_if_new(topology.rings, seen, atoms, "monomer-plane", &topology.atom_elements);
-
-        if (atoms.size() > 6) {
-            std::unordered_set<std::string> plane_atoms(atoms.begin(), atoms.end());
-            std::map<std::string, std::set<std::string>> plane_graph;
-            for (const auto& item : all_bond_graph) {
-                if (plane_atoms.count(item.first) == 0) continue;
-                for (const std::string& nb : item.second) {
-                    if (plane_atoms.count(nb) != 0) {
-                        plane_graph[item.first].insert(nb);
-                    }
-                }
-            }
-            std::vector<std::vector<std::string>> plane_cycles;
-            find_cycles_in_graph(plane_graph, plane_cycles);
-            for (const auto& cycle : plane_cycles) {
-                add_ring_if_new(topology.rings, seen, cycle, "monomer-plane-cycle", &topology.atom_elements);
-            }
-        }
-    }
-
-    if (!topology.rings.empty()) return topology;
-
     std::vector<std::vector<std::string>> aromatic_cycles;
     find_cycles_in_graph(aromatic_bond_graph, aromatic_cycles);
     for (const auto& cycle : aromatic_cycles) {
@@ -260,14 +228,6 @@ inline MonomerTopology build_monomer_topology(const std::string& res_upper,
     }
 
     if (!topology.rings.empty()) return topology;
-
-    if (!is_standard_polymer_residue(res_upper)) {
-        std::vector<std::vector<std::string>> broad_cycles;
-        find_cycles_in_graph(all_bond_graph, broad_cycles);
-        for (const auto& cycle : broad_cycles) {
-            add_ring_if_new(topology.rings, seen, cycle, "monomer-bond-cycle", &topology.atom_elements);
-        }
-    }
 
     return topology;
 }
