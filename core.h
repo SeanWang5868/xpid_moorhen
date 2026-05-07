@@ -2,16 +2,20 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <gemmi/model.hpp>
+#include <gemmi/monlib.hpp>
 #include <gemmi/neighbor.hpp>
 #include <gemmi/polyheur.hpp>
+#include <gemmi/topo.hpp>
 #include <gemmi/util.hpp>
 
 #include "config.h"
@@ -117,6 +121,70 @@ inline void select_best_altconf(gemmi::Structure& structure) {
 inline void prepare_structure_for_detection(gemmi::Structure& structure) {
     normalize_atom_and_residue_names(structure);
     select_best_altconf(structure);
+    gemmi::remove_waters(structure);
+    structure.remove_empty_chains();
+}
+
+inline std::vector<std::string> collect_residue_names(const gemmi::Structure& structure) {
+    std::set<std::string> seen;
+    std::vector<std::string> resnames;
+    for (const gemmi::Model& model : structure.models) {
+        for (const gemmi::Chain& chain : model.chains) {
+            for (const gemmi::Residue& residue : chain.residues) {
+                std::string name = upper_copy(residue.name);
+                if (!name.empty() && seen.insert(name).second) {
+                    resnames.push_back(std::move(name));
+                }
+            }
+        }
+    }
+    return resnames;
+}
+
+inline void add_hydrogens_from_monomer_library(gemmi::Structure& structure) {
+    std::string mon_lib_path = default_monomer_library_path();
+    if (mon_lib_path.empty() || structure.models.empty()) return;
+
+    std::vector<std::string> resnames = collect_residue_names(structure);
+    if (resnames.empty()) return;
+
+    gemmi::MonLib monlib;
+    gemmi::Logger logger;
+    try {
+        monlib.read_monomer_lib(mon_lib_path, resnames, logger);
+    } catch (...) {
+        return;
+    }
+
+    for (size_t model_idx = 0; model_idx < structure.models.size(); ++model_idx) {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            try {
+                gemmi::prepare_topology(structure, monlib, model_idx,
+                                        gemmi::HydrogenChange::ReAddButWater,
+                                        false, logger, true);
+                break;
+            } catch (const std::exception& err) {
+                std::string message = err.what();
+                if (attempt == 0 && message.find("link") != std::string::npos) {
+                    structure.connections.clear();
+                    continue;
+                }
+                // Keep the original heavy-atom model usable if hydrogen placement
+                // cannot be completed for a problematic component or link.
+                break;
+            } catch (...) {
+                break;
+            }
+        }
+    }
+}
+
+inline void prepare_structure_for_detection(gemmi::Structure& structure, bool add_hydrogens) {
+    normalize_atom_and_residue_names(structure);
+    select_best_altconf(structure);
+    if (add_hydrogens) {
+        add_hydrogens_from_monomer_library(structure);
+    }
     gemmi::remove_waters(structure);
     structure.remove_empty_chains();
 }
@@ -487,12 +555,13 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
 inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure& input_structure,
                                                           bool use_cone = true,
                                                           double min_occ = 0.0,
-                                                          bool generate_missing_h_cone = true) {
+                                                          bool generate_missing_h_cone = true,
+                                                          bool add_hydrogens = true) {
     std::vector<InteractionResult> results;
     if (input_structure.models.empty()) return results;
 
     gemmi::Structure structure = input_structure;
-    prepare_structure_for_detection(structure);
+    prepare_structure_for_detection(structure, add_hydrogens);
 
     for (size_t model_idx = 0; model_idx < structure.models.size(); ++model_idx) {
         gemmi::Model& model = structure.models[model_idx];

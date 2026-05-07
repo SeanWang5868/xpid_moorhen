@@ -289,11 +289,17 @@ inline const MonomerTopology& get_monomer_topology(const std::string& res_name,
     std::string lib_path = mon_lib_path.empty() ? default_monomer_library_path() : mon_lib_path;
     std::string cache_key = lib_path + "::" + res_upper;
 
-    auto cached = cache.find(cache_key);
-    if (cached != cache.end()) return cached->second;
-
     MonomerTopology topology;
     std::filesystem::path cif_path = find_monomer_cif_path(res_upper, lib_path);
+    auto cached = cache.find(cache_key);
+    if (cached != cache.end()) {
+        const bool has_topology = !cached->second.rings.empty() ||
+                                  !cached->second.donors.empty() ||
+                                  !cached->second.atom_elements.empty();
+        if (has_topology || cif_path.empty()) return cached->second;
+        cache.erase(cached);
+    }
+
     if (!cif_path.empty()) {
         try {
             topology = read_monomer_topology(res_upper, cif_path);
