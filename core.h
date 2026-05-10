@@ -4,6 +4,7 @@
 #include <cmath>
 #include <exception>
 #include <map>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -141,6 +142,29 @@ inline std::vector<std::string> collect_residue_names(const gemmi::Structure& st
     return resnames;
 }
 
+inline bool remove_residue_from_topology_error(gemmi::Structure& structure,
+                                               const std::string& message) {
+    static const std::regex bonded_pattern(R"(bonded to ([^/]+)/([^ ]+) ([^/]+)/([^ ]+) failed)");
+    std::smatch match;
+    if (!std::regex_search(message, match, bonded_pattern)) return false;
+
+    std::string bad_chain = match[1].str();
+    std::string bad_seqid = gemmi::trim_str(match[3].str());
+
+    for (gemmi::Model& model : structure.models) {
+        for (gemmi::Chain& chain : model.chains) {
+            if (chain.name != bad_chain) continue;
+            for (auto it = chain.residues.begin(); it != chain.residues.end(); ++it) {
+                if (gemmi::trim_str(it->seqid.str()) == bad_seqid) {
+                    chain.residues.erase(it);
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 inline void add_hydrogens_from_monomer_library(gemmi::Structure& structure) {
     std::string mon_lib_path = default_monomer_library_path();
     if (mon_lib_path.empty() || structure.models.empty()) return;
@@ -156,8 +180,9 @@ inline void add_hydrogens_from_monomer_library(gemmi::Structure& structure) {
         return;
     }
 
+    constexpr int max_attempts = 10;
     for (size_t model_idx = 0; model_idx < structure.models.size(); ++model_idx) {
-        for (int attempt = 0; attempt < 2; ++attempt) {
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
             try {
                 gemmi::prepare_topology(structure, monlib, model_idx,
                                         gemmi::HydrogenChange::ReAddButWater,
@@ -165,8 +190,11 @@ inline void add_hydrogens_from_monomer_library(gemmi::Structure& structure) {
                 break;
             } catch (const std::exception& err) {
                 std::string message = err.what();
-                if (attempt == 0 && message.find("link") != std::string::npos) {
+                if (message.find("link") != std::string::npos) {
                     structure.connections.clear();
+                    continue;
+                }
+                if (remove_residue_from_topology_error(structure, message)) {
                     continue;
                 }
                 // Keep the original heavy-atom model usable if hydrogen placement
