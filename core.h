@@ -165,8 +165,11 @@ inline bool remove_residue_from_topology_error(gemmi::Structure& structure,
     return false;
 }
 
-inline void add_hydrogens_from_monomer_library(gemmi::Structure& structure) {
-    std::string mon_lib_path = default_monomer_library_path();
+inline void add_hydrogens_from_monomer_library(gemmi::Structure& structure,
+                                               const std::string& mon_lib_path_override = "") {
+    std::string mon_lib_path = mon_lib_path_override.empty()
+        ? default_monomer_library_path()
+        : mon_lib_path_override;
     if (mon_lib_path.empty() || structure.models.empty()) return;
 
     std::vector<std::string> resnames = collect_residue_names(structure);
@@ -207,11 +210,13 @@ inline void add_hydrogens_from_monomer_library(gemmi::Structure& structure) {
     }
 }
 
-inline void prepare_structure_for_detection(gemmi::Structure& structure, bool add_hydrogens) {
+inline void prepare_structure_for_detection(gemmi::Structure& structure,
+                                            bool add_hydrogens,
+                                            const std::string& mon_lib_path = "") {
     normalize_atom_and_residue_names(structure);
     select_best_altconf(structure);
     if (add_hydrogens) {
-        add_hydrogens_from_monomer_library(structure);
+        add_hydrogens_from_monomer_library(structure, mon_lib_path);
     }
     gemmi::remove_waters(structure);
     structure.remove_empty_chains();
@@ -269,8 +274,9 @@ inline std::string join_remark_parts(const std::vector<std::string>& parts) {
 inline void maybe_add_pi_pi_remark(std::vector<std::string>& remarks,
                                    const gemmi::Residue& donor_residue,
                                    const gemmi::Position& pi_center,
-                                   const gemmi::Position& pi_normal) {
-    const auto& donor_rings = get_aromatic_rings(donor_residue.name);
+                                   const gemmi::Position& pi_normal,
+                                   const std::string& mon_lib_path = "") {
+    const auto& donor_rings = get_aromatic_rings(donor_residue.name, mon_lib_path);
     for (const AromaticRing& donor_ring : donor_rings) {
         std::vector<const gemmi::Atom*> donor_atoms;
         donor_atoms.reserve(donor_ring.atoms.size());
@@ -330,7 +336,8 @@ inline void record_hit(std::vector<InteractionResult>& results,
                        bool is_cone,
                        double combined_occ,
                        int sym_op,
-                       double min_occ) {
+                       double min_occ,
+                       const std::string& mon_lib_path = "") {
     if (combined_occ < min_occ) return;
 
     std::vector<std::string> remarks;
@@ -338,7 +345,7 @@ inline void record_hit(std::vector<InteractionResult>& results,
     if (pi_res.name == "TRP" && ring.atoms.size() == 5) remarks.push_back("TRP 5-ring acceptor");
     if (sym_op != 0) remarks.push_back("SymContact op " + std::to_string(sym_op));
     if (is_cation_donor(x_cra.residue->name, x_atom.name)) remarks.push_back("Cation-pi");
-    maybe_add_pi_pi_remark(remarks, *x_cra.residue, pi_center, pi_normal);
+    maybe_add_pi_pi_remark(remarks, *x_cra.residue, pi_center, pi_normal, mon_lib_path);
 
     InteractionResult result;
     result.pdb = structure.name.empty() ? "UNKNOWN" : structure.name;
@@ -455,7 +462,8 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
                                double proj_dist,
                                double combined_occ,
                                int sym_op,
-                               double min_occ) {
+                               double min_occ,
+                               const std::string& mon_lib_path = "") {
     bool found = false;
     auto h_marks = ns.find_atoms(x_pos, x_atom.altloc, 0.0, DIST_CUTOFF_H);
 
@@ -490,7 +498,8 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
             record_hit(results, structure, model_id, pi_chain, pi_res, ring, ring_index,
                        pi_center, pi_normal, pi_b_mean, avg_pi_occ, x_cra, x_atom,
                        h_atom.name, dist_x_pi, is_plevin, is_hudson, x_pos, theta,
-                       xh_pi_angle, xpcn_angle, proj_dist, false, h_combined_occ, sym_op, min_occ);
+                       xh_pi_angle, xpcn_angle, proj_dist, false, h_combined_occ, sym_op, min_occ,
+                       mon_lib_path);
         }
     }
 
@@ -521,7 +530,8 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
                            double combined_occ,
                            int sym_op,
                            double min_occ,
-                           bool generate_missing_h_cone) {
+                           bool generate_missing_h_cone,
+                           const std::string& mon_lib_path = "") {
     (void) generate_missing_h_cone;
     std::string parent_name = get_cone_parent_atom(x_cra.residue->name, x_atom.name);
     if (parent_name.empty()) return;
@@ -572,7 +582,7 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
         record_hit(results, structure, model_id, pi_chain, pi_res, ring, ring_index,
                    pi_center, pi_normal, pi_b_mean, avg_pi_occ, x_cra, x_atom, "(virt)",
                    dist_x_pi, best_plevin, best_hudson, x_pos, best_theta, best_angle,
-                   xpcn_angle, proj_dist, true, combined_occ, sym_op, min_occ);
+                   xpcn_angle, proj_dist, true, combined_occ, sym_op, min_occ, mon_lib_path);
     }
 }
 
@@ -580,12 +590,13 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
                                                           bool use_cone = true,
                                                           double min_occ = 0.0,
                                                           bool generate_missing_h_cone = true,
-                                                          bool add_hydrogens = true) {
+                                                          bool add_hydrogens = true,
+                                                          const std::string& mon_lib_path = "") {
     std::vector<InteractionResult> results;
     if (input_structure.models.empty()) return results;
 
     gemmi::Structure structure = input_structure;
-    prepare_structure_for_detection(structure, add_hydrogens);
+    prepare_structure_for_detection(structure, add_hydrogens, mon_lib_path);
 
     for (size_t model_idx = 0; model_idx < structure.models.size(); ++model_idx) {
         gemmi::Model& model = structure.models[model_idx];
@@ -596,7 +607,7 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
 
         for (const gemmi::Chain& pi_chain : model.chains) {
             for (const gemmi::Residue& pi_res : pi_chain.residues) {
-                const auto& rings = get_aromatic_rings(pi_res.name);
+                const auto& rings = get_aromatic_rings(pi_res.name, mon_lib_path);
                 if (rings.empty()) continue;
 
                 for (size_t ring_idx = 0; ring_idx < rings.size(); ++ring_idx) {
@@ -658,7 +669,7 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
                             results, orig_h_positions, structure, model, ns, model_id,
                             pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
                             pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
-                            xpcn_angle, proj_dist, combined_occ, sym_op, min_occ);
+                            xpcn_angle, proj_dist, combined_occ, sym_op, min_occ, mon_lib_path);
 
                         if (!found_explicit && use_cone &&
                             !is_cone_scan_suppressed(x_cra.residue->name, x_atom.name)) {
@@ -667,7 +678,7 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
                                 pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
                                 pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
                                 xpcn_angle, proj_dist, combined_occ, sym_op, min_occ,
-                                generate_missing_h_cone);
+                                generate_missing_h_cone, mon_lib_path);
                         }
                     }
                 }

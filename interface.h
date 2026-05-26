@@ -140,6 +140,12 @@ inline std::string detect_xhpi_interactions_json(const gemmi::Structure& st) {
     return format_results_as_json(raw_results);
 }
 
+inline std::string detect_xhpi_interactions_json_with_monomer_library(const gemmi::Structure& st,
+                                                                      const std::string& mon_lib_path) {
+    std::vector<InteractionResult> raw_results = detect_interactions(st, true, 0.0, true, true, mon_lib_path);
+    return format_results_as_json(raw_results);
+}
+
 inline std::string xpid(const gemmi::Structure& st) {
     return detect_xhpi_interactions_json(st);
 }
