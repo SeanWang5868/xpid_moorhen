@@ -15,6 +15,14 @@ or geometry label of a hit.
 - Explicit H/D atoms require an element-appropriate covalent distance and an
   unambiguous owner. When a usable monomer dictionary is available, its bond
   table is authoritative. Neutron D names are matched to their H equivalents.
+- Automatic Cone detection is limited to the chemically frozen SER/THR/TYR/CYS
+  single-H groups and ALA/VAL/LEU/ILE/MET/MSE/THR methyl groups. These groups
+  use their production nuclear X-H lengths and parent-X-H angles; methyl
+  hydrogens rotate as one complete three-H conformer.
+- A Cone hit exists only when one complete, altloc-compatible conformer is
+  sterically allowed and satisfies Hudson or Plevin. Valid acceptor-directed
+  H-bond contacts are not treated as clashes. The reported virtual H is chosen
+  deterministically, and existing riding-H coordinates do not bias this route.
 - Lys/Arg cation-pi atoms are excluded from XH-pi detection.
 - Default output remains Hudson/Plevin XH-pi data for consumption by Moorhen.
 
