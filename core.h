@@ -8,6 +8,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -20,6 +21,7 @@
 #include <gemmi/util.hpp>
 
 #include "config.h"
+#include "cone.h"
 #include "geometry.h"
 #include "topology.h"
 
@@ -110,27 +112,6 @@ inline std::vector<AtomVariant> atom_variants_for_names(
         }
     }
     return variants;
-}
-
-inline const gemmi::Atom* find_compatible_atom(const gemmi::Residue& residue,
-                                               const std::string& atom_name,
-                                               char active_altloc) {
-    const gemmi::Atom* exact = nullptr;
-    const gemmi::Atom* blank = nullptr;
-    int exact_count = 0;
-    int blank_count = 0;
-    for (const gemmi::Atom& atom : residue.atoms) {
-        if (atom.name != atom_name) continue;
-        if (atom.altloc == active_altloc && active_altloc != '\0') {
-            exact = &atom;
-            ++exact_count;
-        } else if (atom.altloc == '\0') {
-            blank = &atom;
-            ++blank_count;
-        }
-    }
-    if (active_altloc != '\0' && exact_count == 1) return exact;
-    return blank_count == 1 ? blank : nullptr;
 }
 
 inline void normalize_atom_and_residue_names(gemmi::Structure& structure) {
@@ -368,11 +349,12 @@ inline bool is_donor_blocked(const gemmi::Atom& x_atom,
     auto close_atoms = ns.find_atoms(search_pos, '\0', 0.0, METAL_BLOCKING_RADIUS);
 
     for (const gemmi::NeighborSearch::Mark* mark : close_atoms) {
-        double dist = mark->pos.dist(search_pos);
-        if (dist < 0.01) continue;
-
         gemmi::const_CRA cra = mark->to_cra(model);
         if (!cra.atom) continue;
+        const gemmi::Position effective_pos = ns.grid.unit_cell.find_nearest_pbc_position(
+            search_pos, cra.atom->pos, mark->image_idx);
+        double dist = effective_pos.dist(search_pos);
+        if (dist < 0.01) continue;
         if (!altlocs_compatible(x_atom.altloc, cra.atom->altloc)) continue;
 
         std::string neighbor_el = element_name_upper(cra.atom->element);
@@ -529,52 +511,7 @@ inline void record_hit(std::vector<InteractionResult>& results,
     results.push_back(std::move(result));
 }
 
-inline void collect_cone_environment(gemmi::Model& model,
-                                     gemmi::NeighborSearch& ns,
-                                     const gemmi::const_CRA& x_cra,
-                                     const gemmi::Position& x_pos,
-                                     std::vector<gemmi::Position>& env_coords,
-                                     std::vector<gemmi::Position>& acceptor_coords) {
-    auto neighbors = ns.find_atoms(x_pos, '\0', 0.0, 4.0);
-    for (const gemmi::NeighborSearch::Mark* mark : neighbors) {
-        if (mark->pos.dist(x_pos) < 0.01) continue;
-        gemmi::const_CRA n_cra = mark->to_cra(model);
-        if (!n_cra.atom || same_residue(n_cra, x_cra)) continue;
-        if (!altlocs_compatible(x_cra.atom->altloc, n_cra.atom->altloc)) continue;
-
-        std::string elem = element_name_upper(n_cra.atom->element);
-        if (elem == "H" || elem == "D" || elem.empty()) continue;
-
-        double dist = mark->pos.dist(x_pos);
-        if (dist <= 4.0) env_coords.push_back(mark->pos);
-        if (dist <= 3.5 && (elem == "O" || elem == "N" || elem == "S")) {
-            acceptor_coords.push_back(mark->pos);
-        }
-    }
-}
-
-inline std::vector<gemmi::Position> generate_wobbled_hydrogens(const gemmi::Position& parent_pos,
-                                                               const gemmi::Position& x_pos,
-                                                               const std::vector<gemmi::Position>& orig_h_positions,
-                                                               const std::vector<gemmi::Position>& env_coords) {
-    std::vector<gemmi::Position> candidates;
-    gemmi::Position axis = normalize(x_pos - parent_pos);
-    if (magnitude(axis) < 1e-8) return candidates;
-
-    const int angles[] = {-20, -15, -10, -5, 5, 10, 15, 20};
-    for (const gemmi::Position& h_orig : orig_h_positions) {
-        gemmi::Position vec_xh = h_orig - x_pos;
-        for (int angle_deg : angles) {
-            double angle_rad = static_cast<double>(angle_deg) * M_PI / 180.0;
-            gemmi::Position h_pos = x_pos + rotate_vector_around_axis(vec_xh, axis, angle_rad);
-            if (!has_clash(h_pos, env_coords, 2.0)) candidates.push_back(h_pos);
-        }
-    }
-    return candidates;
-}
-
-inline bool run_explicit_track(std::vector<InteractionResult>& results,
-                               std::vector<gemmi::Position>& orig_h_positions,
+inline void run_explicit_track(std::vector<InteractionResult>& results,
                                const gemmi::Structure& structure,
                                gemmi::Model& model,
                                gemmi::NeighborSearch& ns,
@@ -598,10 +535,9 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
                                int sym_op,
                                double min_occ,
                                const std::string& mon_lib_path = "") {
-    bool found = false;
     const std::string x_elem = element_name_upper(x_atom.element);
     const double xh_max = get_covalent_xh_max(x_elem);
-    if (xh_max <= 0.0) return false;
+    if (xh_max <= 0.0) return;
     auto h_marks = ns.find_atoms(x_pos, x_atom.altloc, 0.0, xh_max);
 
     for (const gemmi::NeighborSearch::Mark* h_mark : h_marks) {
@@ -626,8 +562,6 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
             continue;
         }
 
-        orig_h_positions.push_back(h_atom.pos);
-
         double xh_pi_angle = calculate_xh_picenter_angle(x_pos, h_atom.pos, pi_center);
         double theta = calculate_hudson_theta(pi_center, x_pos, h_atom.pos, pi_normal);
         if (xh_pi_angle < 0.0 || theta < 0.0 || xpcn_angle < 0.0) continue;
@@ -637,7 +571,6 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
                          proj_dist <= (ring.atoms.size() == 6 ? 2.0 : 1.6) && theta <= 40.0) ? 1 : 0;
 
         if (is_plevin || is_hudson) {
-            found = true;
             double h_combined_occ = std::min(combined_occ, static_cast<double>(h_atom.occ));
             record_hit(results, structure, model_id, pi_chain, pi_res, ring, ring_index,
                        pi_center, pi_normal, pi_b_mean, avg_pi_occ, x_cra, x_atom,
@@ -646,12 +579,47 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
                        mon_lib_path);
         }
     }
+}
 
-    return found;
+inline std::vector<ConeEnvironmentAtom> collect_binary_cone_environment(
+        gemmi::Model& model,
+        gemmi::NeighborSearch& ns,
+        const gemmi::const_CRA& x_cra,
+        const DonorConformer& donor_conformer,
+        const gemmi::Position& x_pos,
+        const gemmi::Position& parent_pos) {
+    std::vector<ConeEnvironmentAtom> environment;
+    for (const gemmi::NeighborSearch::Mark* mark :
+         ns.find_atoms(x_pos, '\0', 0.0, 4.0)) {
+        gemmi::const_CRA neighbor = mark->to_cra(model);
+        if (!neighbor.atom || !neighbor.residue) continue;
+        const std::string element = element_name_upper(neighbor.atom->element);
+        if (element.empty() || element == "H" || element == "D") continue;
+
+        const gemmi::Position position = ns.grid.unit_cell.find_nearest_pbc_position(
+            x_pos, neighbor.atom->pos, mark->image_idx);
+        const bool in_donor_residue = same_residue(neighbor, x_cra);
+        if (in_donor_residue) {
+            if (!altlocs_compatible(donor_conformer.active_altloc(), neighbor.atom->altloc)) {
+                continue;
+            }
+            if (neighbor.atom == donor_conformer.x_atom && position.dist(x_pos) < 0.01) {
+                continue;
+            }
+            if (neighbor.atom == donor_conformer.parent_atom &&
+                position.dist(parent_pos) < 0.01) {
+                continue;
+            }
+        } else if (!altlocs_compatible(donor_conformer.x_altloc, neighbor.atom->altloc)) {
+            continue;
+        }
+        environment.push_back(
+            make_cone_environment_atom(position, *neighbor.atom, *neighbor.residue));
+    }
+    return environment;
 }
 
 inline void run_cone_track(std::vector<InteractionResult>& results,
-                           const std::vector<gemmi::Position>& orig_h_positions,
                            const gemmi::Structure& structure,
                            gemmi::Model& model,
                            gemmi::NeighborSearch& ns,
@@ -674,61 +642,77 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
                            double combined_occ,
                            int sym_op,
                            double min_occ,
-                           bool generate_missing_h_cone,
                            const std::string& mon_lib_path = "") {
-    (void) generate_missing_h_cone;
-    std::string parent_name = get_cone_parent_atom(x_cra.residue->name, x_atom.name);
-    if (parent_name.empty()) return;
+    const RotatableGroupDefinition* definition = get_rotatable_group_definition(
+        x_cra.residue->name, x_atom.name);
+    if (!definition) return;
+    const DonorConformerResolution resolution = resolve_donor_conformers(
+        *x_cra.residue, x_atom, *definition);
 
-    const gemmi::Atom* parent_atom = find_compatible_atom(
-        *x_cra.residue, parent_name, x_atom.altloc);
-    if (!parent_atom) return;
+    const DonorConformer* best_conformer = nullptr;
+    std::optional<ConePositiveEvidence> best_evidence;
+    for (const DonorConformer& donor_conformer : resolution.conformers) {
+        const gemmi::Position parent_pos = ns.grid.unit_cell.find_nearest_pbc_position(
+            x_pos, donor_conformer.parent_atom->pos, 0);
+        const std::vector<ConeEnvironmentAtom> environment = collect_binary_cone_environment(
+            model, ns, x_cra, donor_conformer, x_pos, parent_pos);
+        std::optional<ConePositiveEvidence> evidence = evaluate_binary_cone(
+            parent_pos, x_pos, *definition, environment, pi_center, pi_normal,
+            dist_x_pi, max_dist, xpcn_angle, proj_dist, ring.atoms.size());
+        if (!evidence) continue;
 
-    std::vector<gemmi::Position> env_coords;
-    std::vector<gemmi::Position> acceptor_coords;
-    collect_cone_environment(model, ns, x_cra, x_pos, env_coords, acceptor_coords);
-
-    bool locked = check_hbond_locked(x_pos, orig_h_positions, acceptor_coords);
-    if (locked) return;
-
-    std::string x_elem = element_name_upper(x_atom.element);
-    std::vector<gemmi::Position> h_candidates;
-    if (is_flexible_donor(x_cra.residue->name, x_atom.name)) {
-        h_candidates = generate_rotated_hydrogens(parent_atom->pos, x_pos, x_elem, env_coords, 2.0, 72);
-    } else if (!orig_h_positions.empty()) {
-        h_candidates = generate_wobbled_hydrogens(parent_atom->pos, x_pos, orig_h_positions, env_coords);
-    }
-
-    double best_xh_angle = -1.0;
-    double best_theta = 0.0;
-    double best_angle = 180.0;
-    int best_plevin = 0;
-    int best_hudson = 0;
-
-    for (const gemmi::Position& h_pos : h_candidates) {
-        double theta = calculate_hudson_theta(pi_center, x_pos, h_pos, pi_normal);
-        double xh_pi_angle = calculate_xh_picenter_angle(x_pos, h_pos, pi_center);
-        if (theta < 0.0 || xh_pi_angle < 0.0 || xpcn_angle < 0.0) continue;
-
-        int is_plevin = (dist_x_pi < max_dist && xpcn_angle < 25.0 && xh_pi_angle >= 120.0) ? 1 : 0;
-        int is_hudson = (dist_x_pi <= max_dist && std::isfinite(proj_dist) &&
-                         proj_dist <= (ring.atoms.size() == 6 ? 2.0 : 1.6) && theta <= 40.0) ? 1 : 0;
-
-        if ((is_plevin || is_hudson) && xh_pi_angle > best_xh_angle) {
-            best_xh_angle = xh_pi_angle;
-            best_theta = theta;
-            best_angle = xh_pi_angle;
-            best_plevin = is_plevin;
-            best_hudson = is_hudson;
+        const bool higher_occupancy = !best_conformer ||
+            donor_conformer.occupancy() > best_conformer->occupancy() + 1e-9;
+        const bool equal_occupancy_better_evidence = best_conformer &&
+            std::abs(donor_conformer.occupancy() - best_conformer->occupancy()) <= 1e-9 &&
+            cone_evidence_rank(*evidence) > cone_evidence_rank(*best_evidence);
+        if (higher_occupancy || equal_occupancy_better_evidence) {
+            best_conformer = &donor_conformer;
+            best_evidence = evidence;
         }
     }
 
-    if (best_xh_angle >= 0.0) {
+    if (best_conformer && best_evidence) {
+        const double cone_combined_occ = std::min(
+            combined_occ, best_conformer->occupancy());
         record_hit(results, structure, model_id, pi_chain, pi_res, ring, ring_index,
-                   pi_center, pi_normal, pi_b_mean, avg_pi_occ, x_cra, x_atom, "(virt)",
-                   dist_x_pi, best_plevin, best_hudson, x_pos, best_theta, best_angle,
-                   xpcn_angle, proj_dist, true, combined_occ, sym_op, min_occ, mon_lib_path);
+                   pi_center, pi_normal, pi_b_mean, avg_pi_occ, x_cra, x_atom, "virt",
+                   dist_x_pi, best_evidence->is_plevin, best_evidence->is_hudson,
+                   x_pos, best_evidence->theta, best_evidence->xh_pi_angle,
+                   xpcn_angle, proj_dist, true, cone_combined_occ, sym_op, min_occ,
+                   mon_lib_path);
     }
+}
+
+inline std::vector<InteractionResult> deduplicate_interaction_results(
+        const std::vector<InteractionResult>& results) {
+    using Key = std::tuple<
+        std::string, std::string, std::string, std::string, std::string,
+        std::string, std::string, std::string, std::string, std::string,
+        std::string, int>;
+    std::map<Key, size_t> selected_indices;
+    std::vector<InteractionResult> selected;
+    for (const InteractionResult& result : results) {
+        const Key key{
+            result.pdb, result.model, result.pi_chain, result.pi_res,
+            result.pi_seqid, result.pi_ring, result.X_chain, result.X_res,
+            result.X_seqid, result.X_atom, result.H_atom, result.sym_op};
+        const auto score = [](const InteractionResult& hit) {
+            return std::make_tuple(
+                hit.combined_occ,
+                hit.is_hudson + hit.is_plevin,
+                -hit.dist_X_Pi,
+                -hit.proj_dist);
+        };
+        auto existing = selected_indices.find(key);
+        if (existing == selected_indices.end()) {
+            selected_indices.emplace(key, selected.size());
+            selected.push_back(result);
+        } else if (score(result) > score(selected[existing->second])) {
+            selected[existing->second] = result;
+        }
+    }
+    return selected;
 }
 
 inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure& input_structure,
@@ -739,6 +723,7 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
                                                           const std::string& mon_lib_path = "") {
     std::vector<InteractionResult> results;
     if (input_structure.models.empty()) return results;
+    (void) generate_missing_h_cone;
 
     gemmi::Structure structure = input_structure;
     prepare_structure_for_detection(structure, add_hydrogens, mon_lib_path);
@@ -806,21 +791,22 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
                                 avg_pi_occ, static_cast<double>(x_atom.occ));
                             int sym_op = 0;
 
-                            std::vector<gemmi::Position> orig_h_positions;
-                            bool found_explicit = run_explicit_track(
-                                results, orig_h_positions, structure, model, ns, model_id,
-                                pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
-                                pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
-                                xpcn_angle, proj_dist, combined_occ, sym_op, min_occ, mon_lib_path);
-
-                            if (!found_explicit && use_cone &&
-                                !is_cone_scan_suppressed(x_cra.residue->name, x_atom.name)) {
+                            const RotatableGroupDefinition* cone_definition =
+                                get_rotatable_group_definition(
+                                    x_cra.residue->name, x_atom.name);
+                            if (use_cone && cone_definition) {
                                 run_cone_track(
-                                    results, orig_h_positions, structure, model, ns, model_id,
+                                    results, structure, model, ns, model_id,
                                     pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
                                     pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
                                     xpcn_angle, proj_dist, combined_occ, sym_op, min_occ,
-                                    generate_missing_h_cone, mon_lib_path);
+                                    mon_lib_path);
+                            } else {
+                                run_explicit_track(
+                                    results, structure, model, ns, model_id,
+                                    pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
+                                    pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
+                                    xpcn_angle, proj_dist, combined_occ, sym_op, min_occ, mon_lib_path);
                             }
                         }
                     }
@@ -829,7 +815,7 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
         }
     }
 
-    return results;
+    return deduplicate_interaction_results(results);
 }
 
 } // namespace xhpi

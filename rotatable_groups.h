@@ -1,7 +1,12 @@
 #pragma once
 
+#include <algorithm>
+#include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
+#include <gemmi/model.hpp>
 
 namespace xhpi {
 
@@ -18,6 +23,28 @@ struct RotatableGroupDefinition {
     double xh_bond_length = 1.0;
     double parent_x_h_angle = 109.5;
     int rotation_period = 360;
+};
+
+struct DonorConformer {
+    const gemmi::Atom* x_atom = nullptr;
+    char x_altloc = '\0';
+    const gemmi::Atom* parent_atom = nullptr;
+    char parent_altloc = '\0';
+
+    char active_altloc() const {
+        return x_altloc != '\0' ? x_altloc : parent_altloc;
+    }
+
+    double occupancy() const {
+        if (!x_atom || !parent_atom) return 0.0;
+        return std::min(static_cast<double>(x_atom->occ),
+                        static_cast<double>(parent_atom->occ));
+    }
+};
+
+struct DonorConformerResolution {
+    std::vector<DonorConformer> conformers;
+    std::string issue;
 };
 
 inline RotatableGroupDefinition single_hydrogen_group(
@@ -62,6 +89,63 @@ inline const RotatableGroupDefinition* get_rotatable_group_definition(
         const std::string& atom_name) {
     auto it = ROTATABLE_GROUPS.find(residue_name + ":" + atom_name);
     return it == ROTATABLE_GROUPS.end() ? nullptr : &it->second;
+}
+
+inline DonorConformerResolution resolve_donor_conformers(
+        const gemmi::Residue& residue,
+        const gemmi::Atom& x_atom,
+        const RotatableGroupDefinition& definition) {
+    std::map<char, std::vector<const gemmi::Atom*>> parents_by_altloc;
+    for (const gemmi::Atom& atom : residue.atoms) {
+        if (atom.name == definition.parent_atom_name) {
+            parents_by_altloc[atom.altloc].push_back(&atom);
+        }
+    }
+    if (parents_by_altloc.empty()) return {{}, "missing_parent"};
+
+    for (const auto& item : parents_by_altloc) {
+        if (item.second.size() != 1) {
+            const std::string label = item.first == '\0'
+                ? "<blank>" : std::string(1, item.first);
+            return {{}, "duplicate_parent_altloc:" + label};
+        }
+    }
+
+    DonorConformerResolution resolution;
+    const char x_altloc = x_atom.altloc;
+    if (x_altloc != '\0') {
+        auto exact = parents_by_altloc.find(x_altloc);
+        if (exact != parents_by_altloc.end()) {
+            resolution.conformers.push_back(
+                {&x_atom, x_altloc, exact->second.front(), x_altloc});
+            return resolution;
+        }
+        auto blank = parents_by_altloc.find('\0');
+        if (blank != parents_by_altloc.end()) {
+            resolution.conformers.push_back(
+                {&x_atom, x_altloc, blank->second.front(), '\0'});
+            return resolution;
+        }
+        std::string available;
+        for (const auto& item : parents_by_altloc) {
+            if (!available.empty()) available += ',';
+            available += item.first == '\0' ? "<blank>" : std::string(1, item.first);
+        }
+        resolution.issue = "incompatible_parent_altloc:" + available;
+        return resolution;
+    }
+
+    auto blank = parents_by_altloc.find('\0');
+    if (blank != parents_by_altloc.end()) {
+        resolution.conformers.push_back(
+            {&x_atom, '\0', blank->second.front(), '\0'});
+        return resolution;
+    }
+    for (const auto& item : parents_by_altloc) {
+        resolution.conformers.push_back(
+            {&x_atom, '\0', item.second.front(), item.first});
+    }
+    return resolution;
 }
 
 }  // namespace xhpi

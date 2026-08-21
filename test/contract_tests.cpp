@@ -355,6 +355,155 @@ void test_minimal_cone_acceptor_typing() {
             "neutral hydroxyl oxygen remains an acceptor when protonated");
 }
 
+void test_cone_parent_altloc_resolution() {
+    const auto* definition = xhpi::get_rotatable_group_definition("LEU", "CD1");
+    require(definition != nullptr, "LEU CD1 rotatable definition missing");
+
+    gemmi::Residue labelled = residue("LEU", 2);
+    labelled.atoms = {
+        atom("CG", "C", 0, 0, 0, 0.65, 'A'),
+        atom("CG", "C", 0, 1, 0, 0.35, 'B'),
+        atom("CD1", "C", 1, 1, 0, 0.35, 'B'),
+    };
+    auto exact = xhpi::resolve_donor_conformers(labelled, labelled.atoms[2], *definition);
+    require(exact.issue.empty() && exact.conformers.size() == 1,
+            "labelled donor must resolve one compatible parent");
+    require(exact.conformers.front().parent_altloc == 'B',
+            "labelled donor must prefer the exact parent altloc");
+    require(std::abs(exact.conformers.front().occupancy() - 0.35) < 1e-6,
+            "donor conformer occupancy must include its parent");
+
+    gemmi::Residue shared_parent = residue("LEU", 3);
+    shared_parent.atoms = {
+        atom("CG", "C", 0, 0, 0),
+        atom("CD1", "C", 1, 0, 0, 0.4, 'B'),
+    };
+    auto shared = xhpi::resolve_donor_conformers(
+        shared_parent, shared_parent.atoms[1], *definition);
+    require(shared.issue.empty() && shared.conformers.size() == 1 &&
+            shared.conformers.front().parent_altloc == '\0',
+            "labelled donor may use one shared blank parent");
+
+    gemmi::Residue blank_donor = residue("LEU", 4);
+    blank_donor.atoms = {
+        atom("CG", "C", 0, 0, 0, 0.7, 'A'),
+        atom("CG", "C", 0, 1, 0, 0.3, 'B'),
+        atom("CD1", "C", 1, 0, 0),
+    };
+    auto split = xhpi::resolve_donor_conformers(
+        blank_donor, blank_donor.atoms[2], *definition);
+    require(split.issue.empty() && split.conformers.size() == 2,
+            "blank donor with labelled parents must produce both conformers");
+    require(split.conformers[0].parent_altloc == 'A' &&
+            split.conformers[1].parent_altloc == 'B',
+            "split parent conformers must be deterministic by altloc");
+
+    gemmi::Residue incompatible = residue("LEU", 5);
+    incompatible.atoms = {
+        atom("CG", "C", 0, 0, 0, 1.0, 'A'),
+        atom("CD1", "C", 1, 0, 0, 1.0, 'B'),
+    };
+    auto rejected = xhpi::resolve_donor_conformers(
+        incompatible, incompatible.atoms[1], *definition);
+    require(rejected.conformers.empty() && !rejected.issue.empty(),
+            "incompatible labelled parent must be rejected explicitly");
+}
+
+void test_binary_cone_uses_deterministic_positive_evidence() {
+    const auto* definition = xhpi::get_rotatable_group_definition("SER", "OG");
+    require(definition != nullptr, "SER OG rotatable definition missing");
+    const gemmi::Position parent(11.42, 10.0, 13.0);
+    const gemmi::Position x_pos(10.0, 10.0, 13.0);
+    const gemmi::Position pi_center(10.0, 10.0, 10.0);
+    const gemmi::Position pi_normal(0.0, 0.0, 1.0);
+    auto evidence = xhpi::evaluate_binary_cone(
+        parent, x_pos, *definition, {}, pi_center, pi_normal,
+        3.0, 4.3, 0.0, 0.0, 6);
+    require(evidence.has_value(), "unblocked SER cone must find positive evidence");
+    require(evidence->is_hudson == 1 && evidence->is_plevin == 1,
+            "best SER evidence must satisfy both published criteria");
+    require(evidence->phi >= 0.0 && evidence->phi < 360.0,
+            "representative virtual hydrogen must retain deterministic phi");
+}
+
+void test_auto_cone_detects_methyl_without_explicit_hydrogen() {
+    gemmi::Residue ala = residue("ALA", 2);
+    ala.atoms = {
+        atom("CA", "C", 11.53, 10.0, 13.0),
+        atom("CB", "C", 10.0, 10.0, 13.0),
+    };
+    gemmi::Structure structure = structure_with_donor(std::move(ala));
+    auto auto_hits = xhpi::detect_interactions(
+        structure, true, 0.0, true, false);
+    require(auto_hits.size() == 1, "auto Cone must detect one implicit ALA methyl hit");
+    require(auto_hits.front().X_atom == "CB" && auto_hits.front().H_atom == "virt",
+            "implicit methyl hit must retain donor identity and virtual-H marker");
+    require(auto_hits.front().method == "Implicit/Cone",
+            "methyl hit must be reported through the Cone route");
+
+    auto explicit_only_hits = xhpi::detect_interactions(
+        structure, false, 0.0, false, false);
+    require(explicit_only_hits.empty(),
+            "a hydrogen-free methyl group cannot pass explicit-only detection");
+}
+
+void test_auto_cone_is_independent_of_riding_hydrogen_direction() {
+    gemmi::Residue ser_without_h = residue("SER", 2);
+    ser_without_h.atoms = {
+        atom("CB", "C", 11.42, 10.0, 13.0),
+        atom("OG", "O", 10.0, 10.0, 13.0),
+    };
+    gemmi::Residue ser_with_away_h = ser_without_h;
+    ser_with_away_h.atoms.push_back(atom("HG", "H", 10.0, 10.0, 13.972));
+
+    auto no_h_hits = xhpi::detect_interactions(
+        structure_with_donor(std::move(ser_without_h)), true, 0.0, true, false);
+    auto away_h_hits = xhpi::detect_interactions(
+        structure_with_donor(std::move(ser_with_away_h)), true, 0.0, true, false);
+    require(no_h_hits.size() == 1 && away_h_hits.size() == 1,
+            "auto Cone must evaluate SER with or without a riding hydrogen");
+    require(no_h_hits.front().is_hudson == away_h_hits.front().is_hudson &&
+            no_h_hits.front().is_plevin == away_h_hits.front().is_plevin &&
+            std::abs(no_h_hits.front().theta - away_h_hits.front().theta) < 1e-10 &&
+            std::abs(no_h_hits.front().angle_xh_pi - away_h_hits.front().angle_xh_pi) < 1e-10,
+            "riding-H coordinates must not bias the binary Cone result");
+}
+
+void test_periodic_metal_contact_blocks_donor() {
+    gemmi::Structure structure;
+    structure.cell = gemmi::UnitCell(30, 30, 30, 90, 90, 90);
+    structure.models.emplace_back(1);
+    structure.models.back().chains.emplace_back("A");
+    gemmi::Residue cys = residue("CYS", 1);
+    cys.atoms.push_back(atom("SG", "S", 0.5, 10.0, 10.0));
+    gemmi::Residue zinc = residue("ZN", 2);
+    zinc.atoms.push_back(atom("ZN", "Zn", 29.0, 10.0, 10.0));
+    structure.models.back().chains.back().residues.push_back(std::move(cys));
+    structure.models.back().chains.back().residues.push_back(std::move(zinc));
+
+    gemmi::Model& model = structure.models.back();
+    gemmi::Atom& sulfur = model.chains.front().residues.front().atoms.front();
+    gemmi::NeighborSearch ns(model, structure.cell, xhpi::DIST_SEARCH_LIMIT);
+    ns.populate(true);
+    require(xhpi::is_donor_blocked(sulfur, model, ns, sulfur.pos),
+            "a periodic 1.5 A metal contact must block XH-pi donor assignment");
+}
+
+void test_equivalent_explicit_altloc_hits_are_deduplicated() {
+    gemmi::Residue pro = residue("PRO", 2);
+    pro.atoms = {
+        atom("CD", "C", 10.0, 10.0, 13.0, 0.5, 'A'),
+        atom("HD2", "H", 10.0, 10.0, 12.0, 0.5, 'A'),
+        atom("CD", "C", 10.0, 10.0, 13.0, 0.5, 'B'),
+        atom("HD2", "H", 10.0, 10.0, 12.0, 0.5, 'B'),
+    };
+    auto hits = explicit_hits(structure_with_donor(std::move(pro)));
+    require(hits.size() == 1,
+            "equivalent explicit altloc hits must produce one Moorhen interaction");
+    require(std::abs(hits.front().combined_occ - 0.5) < 1e-6,
+            "deduplication must retain the selected conformer occupancy");
+}
+
 }  // namespace
 
 int main() {
@@ -372,6 +521,12 @@ int main() {
     run_test("complete methyl sterics", test_any_hydrogen_clash_invalidates_complete_methyl_conformer);
     run_test("valid H-bond contact sterics", test_valid_hbond_contact_is_not_a_steric_clash);
     run_test("minimal Cone acceptor typing", test_minimal_cone_acceptor_typing);
+    run_test("Cone parent altloc resolution", test_cone_parent_altloc_resolution);
+    run_test("deterministic binary Cone evidence", test_binary_cone_uses_deterministic_positive_evidence);
+    run_test("auto Cone methyl routing", test_auto_cone_detects_methyl_without_explicit_hydrogen);
+    run_test("auto Cone riding-H independence", test_auto_cone_is_independent_of_riding_hydrogen_direction);
+    run_test("periodic metal donor blocking", test_periodic_metal_contact_blocks_donor);
+    run_test("explicit altloc result deduplication", test_equivalent_explicit_altloc_hits_are_deduplicated);
 
     if (failures != 0) {
         std::cerr << failures << " contract test(s) failed\n";

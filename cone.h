@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cmath>
+#include <optional>
+#include <tuple>
 #include <vector>
 
 #include <gemmi/model.hpp>
@@ -14,6 +16,16 @@ namespace xhpi {
 struct HydrogenConformer {
     double phi = 0.0;
     std::vector<gemmi::Position> hydrogen_positions;
+};
+
+struct ConePositiveEvidence {
+    double phi = 0.0;
+    size_t hydrogen_index = 0;
+    gemmi::Position hydrogen_position;
+    double theta = -1.0;
+    double xh_pi_angle = -1.0;
+    int is_hudson = 0;
+    int is_plevin = 0;
 };
 
 inline constexpr double CONE_H_VDW_RADIUS = 1.20;
@@ -137,6 +149,59 @@ inline std::vector<HydrogenConformer> generate_group_conformers(
         conformers.push_back(std::move(conformer));
     }
     return conformers;
+}
+
+inline auto cone_evidence_rank(const ConePositiveEvidence& evidence) {
+    const int positive_systems = evidence.is_hudson + evidence.is_plevin;
+    const double theta_for_rank = evidence.theta >= 0.0 ? evidence.theta : 999.0;
+    return std::make_tuple(
+        evidence.is_hudson && evidence.is_plevin ? 1 : 0,
+        positive_systems,
+        -theta_for_rank,
+        evidence.xh_pi_angle,
+        -evidence.phi,
+        -static_cast<long long>(evidence.hydrogen_index));
+}
+
+inline std::optional<ConePositiveEvidence> evaluate_binary_cone(
+        const gemmi::Position& parent_pos,
+        const gemmi::Position& x_pos,
+        const RotatableGroupDefinition& definition,
+        const std::vector<ConeEnvironmentAtom>& environment,
+        const gemmi::Position& pi_center,
+        const gemmi::Position& pi_normal,
+        double dist_x_pi,
+        double max_dist,
+        double xpcn_angle,
+        double proj_dist,
+        size_t ring_size,
+        int step_degrees = 1) {
+    std::optional<ConePositiveEvidence> best;
+    const double ring_radius = ring_size == 6 ? 2.0 : 1.6;
+    for (const HydrogenConformer& conformer :
+         generate_group_conformers(parent_pos, x_pos, definition, step_degrees)) {
+        if (!cone_conformer_is_sterically_valid(conformer, x_pos, environment)) continue;
+        for (size_t h_index = 0; h_index < conformer.hydrogen_positions.size(); ++h_index) {
+            const gemmi::Position& h_pos = conformer.hydrogen_positions[h_index];
+            const double xh_pi_angle = calculate_xh_picenter_angle(x_pos, h_pos, pi_center);
+            const double theta = calculate_hudson_theta(pi_center, x_pos, h_pos, pi_normal);
+            const int is_plevin =
+                dist_x_pi < max_dist && xpcn_angle >= 0.0 && xpcn_angle < 25.0 &&
+                xh_pi_angle >= 120.0 ? 1 : 0;
+            const int is_hudson =
+                dist_x_pi <= max_dist && std::isfinite(proj_dist) &&
+                proj_dist <= ring_radius && theta >= 0.0 && theta <= 40.0 ? 1 : 0;
+            if (!is_plevin && !is_hudson) continue;
+
+            ConePositiveEvidence evidence{
+                conformer.phi, h_index, h_pos, theta, xh_pi_angle,
+                is_hudson, is_plevin};
+            if (!best || cone_evidence_rank(evidence) > cone_evidence_rank(*best)) {
+                best = evidence;
+            }
+        }
+    }
+    return best;
 }
 
 }  // namespace xhpi
