@@ -295,6 +295,66 @@ void test_methyl_conformer_contains_three_coupled_hydrogens() {
             "cationic LYS NZ must not enter the XH-pi cone model");
 }
 
+void test_any_hydrogen_clash_invalidates_complete_methyl_conformer() {
+    const auto* definition = xhpi::get_rotatable_group_definition("ALA", "CB");
+    const gemmi::Position parent(0.0, 0.0, 0.0);
+    const gemmi::Position x_pos(1.53, 0.0, 0.0);
+    auto conformer = xhpi::generate_group_conformers(parent, x_pos, *definition).front();
+
+    gemmi::Residue ligand = residue("LIG", 9);
+    ligand.atoms.push_back(atom("C1", "C", 0.0, 0.0, 0.0));
+    const gemmi::Position blocker_pos = conformer.hydrogen_positions.front();
+    std::vector<xhpi::ConeEnvironmentAtom> environment = {
+        xhpi::make_cone_environment_atom(blocker_pos, ligand.atoms.front(), ligand)
+    };
+    require(!xhpi::cone_conformer_is_sterically_valid(conformer, x_pos, environment),
+            "one clashing methyl H must invalidate the complete CH3 conformer");
+}
+
+void test_valid_hbond_contact_is_not_a_steric_clash() {
+    const auto* definition = xhpi::get_rotatable_group_definition("SER", "OG");
+    const gemmi::Position parent(0.0, 0.0, 0.0);
+    const gemmi::Position x_pos(1.42, 0.0, 0.0);
+    auto conformer = xhpi::generate_group_conformers(parent, x_pos, *definition).front();
+    const gemmi::Position h_pos = conformer.hydrogen_positions.front();
+    const gemmi::Position direction = xhpi::normalize(h_pos - x_pos);
+    const gemmi::Position contact_pos = h_pos + direction * 1.8;
+
+    gemmi::Residue asp = residue("ASP", 9);
+    asp.atoms.push_back(atom("OD1", "O", contact_pos.x, contact_pos.y, contact_pos.z));
+    std::vector<xhpi::ConeEnvironmentAtom> acceptor_environment = {
+        xhpi::make_cone_environment_atom(contact_pos, asp.atoms.front(), asp)
+    };
+    require(xhpi::cone_conformer_is_sterically_valid(
+                conformer, x_pos, acceptor_environment),
+            "a valid 1.8 A, 180 degree H-bond contact must not count as a clash");
+
+    gemmi::Residue lys = residue("LYS", 10);
+    lys.atoms.push_back(atom("NZ", "N", contact_pos.x, contact_pos.y, contact_pos.z));
+    std::vector<xhpi::ConeEnvironmentAtom> non_acceptor_environment = {
+        xhpi::make_cone_environment_atom(contact_pos, lys.atoms.front(), lys)
+    };
+    require(!xhpi::cone_conformer_is_sterically_valid(
+                conformer, x_pos, non_acceptor_environment),
+            "the same close contact to non-acceptor LYS NZ must remain a clash");
+}
+
+void test_minimal_cone_acceptor_typing() {
+    gemmi::Residue ala = residue("ALA", 1);
+    ala.atoms.push_back(atom("O", "O", 0, 0, 0));
+    ala.atoms.push_back(atom("N", "N", 1, 0, 0));
+    require(xhpi::is_cone_hbond_acceptor(ala, ala.atoms[0]),
+            "backbone carbonyl oxygen must be a Cone acceptor");
+    require(!xhpi::is_cone_hbond_acceptor(ala, ala.atoms[1]),
+            "backbone nitrogen must not be a Cone acceptor");
+
+    gemmi::Residue ser = residue("SER", 2);
+    ser.atoms.push_back(atom("OG", "O", 0, 0, 0));
+    ser.atoms.push_back(atom("HG", "H", 0.96, 0, 0));
+    require(xhpi::is_cone_hbond_acceptor(ser, ser.atoms[0]),
+            "neutral hydroxyl oxygen remains an acceptor when protonated");
+}
+
 }  // namespace
 
 int main() {
@@ -309,6 +369,9 @@ int main() {
     run_test("sulfur-deuterium cutoff", test_sulfur_deuterium_uses_element_specific_cutoff);
     run_test("group-specific single-H geometry", test_group_specific_single_hydrogen_geometry);
     run_test("coupled methyl geometry", test_methyl_conformer_contains_three_coupled_hydrogens);
+    run_test("complete methyl sterics", test_any_hydrogen_clash_invalidates_complete_methyl_conformer);
+    run_test("valid H-bond contact sterics", test_valid_hbond_contact_is_not_a_steric_clash);
+    run_test("minimal Cone acceptor typing", test_minimal_cone_acceptor_typing);
 
     if (failures != 0) {
         std::cerr << failures << " contract test(s) failed\n";
