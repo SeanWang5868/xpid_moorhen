@@ -1,0 +1,20 @@
+data_comp_BMA
+_chem_comp.id BMA
+_chem_comp.name 'contract BMA'
+_chem_comp.type non-polymer
+
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+BMA O6 O
+BMA HO6 H
+BMA H1 H
+
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.aromatic
+BMA O6 HO6 SING N

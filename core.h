@@ -53,6 +53,86 @@ inline bool same_residue(const gemmi::const_CRA& a, const gemmi::const_CRA& b) {
     return a.chain == b.chain && a.residue == b.residue;
 }
 
+inline bool altlocs_compatible(char left, char right) {
+    return left == '\0' || right == '\0' || left == right;
+}
+
+struct AtomVariant {
+    char altloc = '\0';
+    std::vector<const gemmi::Atom*> atoms;
+};
+
+inline std::vector<AtomVariant> atom_variants_for_names(
+        const gemmi::Residue& residue,
+        const std::vector<std::string>& atom_names) {
+    std::vector<std::string> names = atom_names;
+    std::sort(names.begin(), names.end());
+
+    std::map<std::string, std::vector<const gemmi::Atom*>> atoms_by_name;
+    for (const std::string& name : names) atoms_by_name[name] = {};
+    for (const gemmi::Atom& atom : residue.atoms) {
+        auto it = atoms_by_name.find(atom.name);
+        if (it != atoms_by_name.end()) it->second.push_back(&atom);
+    }
+    for (const auto& item : atoms_by_name) {
+        if (item.second.empty()) return {};
+    }
+
+    std::set<char> altlocs = {'\0'};
+    for (const auto& item : atoms_by_name) {
+        for (const gemmi::Atom* atom : item.second) {
+            if (atom->altloc != '\0') altlocs.insert(atom->altloc);
+        }
+    }
+
+    std::vector<AtomVariant> variants;
+    std::set<std::vector<const gemmi::Atom*>> seen;
+    for (char altloc : altlocs) {
+        std::vector<const gemmi::Atom*> selected;
+        selected.reserve(names.size());
+        for (const std::string& name : names) {
+            const auto& atoms = atoms_by_name.at(name);
+            const gemmi::Atom* exact = nullptr;
+            const gemmi::Atom* blank = nullptr;
+            for (const gemmi::Atom* atom : atoms) {
+                if (atom->altloc == altloc && !exact) exact = atom;
+                if (atom->altloc == '\0' && !blank) blank = atom;
+            }
+            const gemmi::Atom* chosen = altloc != '\0' ? (exact ? exact : blank) : blank;
+            if (!chosen) {
+                selected.clear();
+                break;
+            }
+            selected.push_back(chosen);
+        }
+        if (!selected.empty() && seen.insert(selected).second) {
+            variants.push_back({altloc, std::move(selected)});
+        }
+    }
+    return variants;
+}
+
+inline const gemmi::Atom* find_compatible_atom(const gemmi::Residue& residue,
+                                               const std::string& atom_name,
+                                               char active_altloc) {
+    const gemmi::Atom* exact = nullptr;
+    const gemmi::Atom* blank = nullptr;
+    int exact_count = 0;
+    int blank_count = 0;
+    for (const gemmi::Atom& atom : residue.atoms) {
+        if (atom.name != atom_name) continue;
+        if (atom.altloc == active_altloc && active_altloc != '\0') {
+            exact = &atom;
+            ++exact_count;
+        } else if (atom.altloc == '\0') {
+            blank = &atom;
+            ++blank_count;
+        }
+    }
+    if (active_altloc != '\0' && exact_count == 1) return exact;
+    return blank_count == 1 ? blank : nullptr;
+}
+
 inline void normalize_atom_and_residue_names(gemmi::Structure& structure) {
     for (gemmi::Model& model : structure.models) {
         for (gemmi::Chain& chain : model.chains) {
@@ -121,7 +201,6 @@ inline void select_best_altconf(gemmi::Structure& structure) {
 
 inline void prepare_structure_for_detection(gemmi::Structure& structure) {
     normalize_atom_and_residue_names(structure);
-    select_best_altconf(structure);
     gemmi::remove_waters(structure);
     structure.remove_empty_chains();
 }
@@ -214,7 +293,6 @@ inline void prepare_structure_for_detection(gemmi::Structure& structure,
                                             bool add_hydrogens,
                                             const std::string& mon_lib_path = "") {
     normalize_atom_and_residue_names(structure);
-    select_best_altconf(structure);
     if (add_hydrogens) {
         add_hydrogens_from_monomer_library(structure, mon_lib_path);
     }
@@ -226,6 +304,60 @@ inline bool is_excluded_donor_atom(const std::string& res_name, const std::strin
     return ((res_name == "ASP" || res_name == "GLU") &&
             (atom_name == "OD1" || atom_name == "OD2" || atom_name == "OE1" || atom_name == "OE2")) ||
            atom_name == "OXT";
+}
+
+inline std::string canonical_hydrogen_name(std::string atom_name) {
+    atom_name = upper_copy(atom_name);
+    if (!atom_name.empty() && atom_name.front() == 'D') atom_name.front() = 'H';
+    return atom_name;
+}
+
+enum class DictionaryHydrogenMatch {
+    Unavailable,
+    Match,
+    Mismatch
+};
+
+inline DictionaryHydrogenMatch dictionary_hydrogen_match(
+        const std::string& res_name,
+        const std::string& x_atom_name,
+        const std::string& h_atom_name,
+        const std::string& mon_lib_path = "") {
+    const MonomerTopology& topology = get_monomer_topology(res_name, mon_lib_path);
+    if (topology.atom_elements.empty()) return DictionaryHydrogenMatch::Unavailable;
+
+    auto donor_it = topology.donors.find(x_atom_name);
+    if (donor_it == topology.donors.end()) return DictionaryHydrogenMatch::Mismatch;
+    const std::string canonical_h = canonical_hydrogen_name(h_atom_name);
+    for (const std::string& dictionary_name : donor_it->second.bonded_hydrogens) {
+        if (canonical_hydrogen_name(dictionary_name) == canonical_h) {
+            return DictionaryHydrogenMatch::Match;
+        }
+    }
+    return DictionaryHydrogenMatch::Mismatch;
+}
+
+inline bool is_unambiguous_covalent_hydrogen(const gemmi::Residue& residue,
+                                             const gemmi::Atom& x_atom,
+                                             const gemmi::Atom& h_atom) {
+    if (!altlocs_compatible(x_atom.altloc, h_atom.altloc)) return false;
+
+    std::vector<std::pair<double, const gemmi::Atom*>> candidates;
+    for (const gemmi::Atom& atom : residue.atoms) {
+        const std::string element = element_name_upper(atom.element);
+        const double cutoff = get_covalent_xh_max(element);
+        if (cutoff <= 0.0 || !altlocs_compatible(x_atom.altloc, atom.altloc)) continue;
+        const double distance = atom.pos.dist(h_atom.pos);
+        if (distance > MIN_COVALENT_XH && distance <= cutoff) {
+            candidates.push_back({distance / cutoff, &atom});
+        }
+    }
+    if (candidates.empty()) return false;
+    std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+        return left.first < right.first;
+    });
+    if (candidates.front().second != &x_atom) return false;
+    return candidates.size() == 1 || candidates[1].first - candidates[0].first >= 0.15;
 }
 
 inline bool is_donor_blocked(const gemmi::Atom& x_atom,
@@ -241,6 +373,7 @@ inline bool is_donor_blocked(const gemmi::Atom& x_atom,
 
         gemmi::const_CRA cra = mark->to_cra(model);
         if (!cra.atom) continue;
+        if (!altlocs_compatible(x_atom.altloc, cra.atom->altloc)) continue;
 
         std::string neighbor_el = element_name_upper(cra.atom->element);
         if (x_elem == "S" && neighbor_el == "S" && cra.atom->name == "SG" &&
@@ -407,6 +540,7 @@ inline void collect_cone_environment(gemmi::Model& model,
         if (mark->pos.dist(x_pos) < 0.01) continue;
         gemmi::const_CRA n_cra = mark->to_cra(model);
         if (!n_cra.atom || same_residue(n_cra, x_cra)) continue;
+        if (!altlocs_compatible(x_cra.atom->altloc, n_cra.atom->altloc)) continue;
 
         std::string elem = element_name_upper(n_cra.atom->element);
         if (elem == "H" || elem == "D" || elem.empty()) continue;
@@ -465,7 +599,10 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
                                double min_occ,
                                const std::string& mon_lib_path = "") {
     bool found = false;
-    auto h_marks = ns.find_atoms(x_pos, x_atom.altloc, 0.0, DIST_CUTOFF_H);
+    const std::string x_elem = element_name_upper(x_atom.element);
+    const double xh_max = get_covalent_xh_max(x_elem);
+    if (xh_max <= 0.0) return false;
+    auto h_marks = ns.find_atoms(x_pos, x_atom.altloc, 0.0, xh_max);
 
     for (const gemmi::NeighborSearch::Mark* h_mark : h_marks) {
         if (h_mark->image_idx != 0) continue;
@@ -478,11 +615,18 @@ inline bool run_explicit_track(std::vector<InteractionResult>& results,
         if (!is_hydrogen_element(h_elem)) continue;
 
         double xh_dist = x_pos.dist(h_atom.pos);
-        if (xh_dist <= MIN_COVALENT_XH || xh_dist > DIST_CUTOFF_H) continue;
+        if (xh_dist <= MIN_COVALENT_XH || xh_dist > xh_max) continue;
+        if (!altlocs_compatible(x_atom.altloc, h_atom.altloc)) continue;
+
+        DictionaryHydrogenMatch dictionary_match = dictionary_hydrogen_match(
+            x_cra.residue->name, x_atom.name, h_atom.name, mon_lib_path);
+        if (dictionary_match == DictionaryHydrogenMatch::Mismatch) continue;
+        if (dictionary_match == DictionaryHydrogenMatch::Unavailable &&
+            !is_unambiguous_covalent_hydrogen(*x_cra.residue, x_atom, h_atom)) {
+            continue;
+        }
 
         orig_h_positions.push_back(h_atom.pos);
-
-        if (h_atom.altloc != '\0' && x_atom.altloc != '\0' && h_atom.altloc != x_atom.altloc) continue;
 
         double xh_pi_angle = calculate_xh_picenter_angle(x_pos, h_atom.pos, pi_center);
         double theta = calculate_hudson_theta(pi_center, x_pos, h_atom.pos, pi_normal);
@@ -536,7 +680,8 @@ inline void run_cone_track(std::vector<InteractionResult>& results,
     std::string parent_name = get_cone_parent_atom(x_cra.residue->name, x_atom.name);
     if (parent_name.empty()) return;
 
-    const gemmi::Atom* parent_atom = x_cra.residue->find_atom(parent_name, '*');
+    const gemmi::Atom* parent_atom = find_compatible_atom(
+        *x_cra.residue, parent_name, x_atom.altloc);
     if (!parent_atom) return;
 
     std::vector<gemmi::Position> env_coords;
@@ -612,73 +757,71 @@ inline std::vector<InteractionResult> detect_interactions(const gemmi::Structure
 
                 for (size_t ring_idx = 0; ring_idx < rings.size(); ++ring_idx) {
                     const AromaticRing& ring = rings[ring_idx];
+                    const auto ring_variants = atom_variants_for_names(pi_res, ring.atoms);
+                    for (const AtomVariant& ring_variant : ring_variants) {
+                        const std::vector<const gemmi::Atom*>& pi_atoms = ring_variant.atoms;
+                        std::vector<gemmi::Position> ring_positions = collect_positions(pi_atoms);
+                        gemmi::Position pi_center = calculate_center(ring_positions);
+                        gemmi::Position pi_normal = calculate_normal(ring_positions);
+                        double planarity = calculate_planarity_deviation(
+                            ring_positions, pi_center, pi_normal);
+                        if (planarity > PLANARITY_CUTOFF) continue;
 
-                    std::vector<const gemmi::Atom*> pi_atoms;
-                    pi_atoms.reserve(ring.atoms.size());
-                    for (const std::string& atom_name : ring.atoms) {
-                        if (const gemmi::Atom* atom = pi_res.find_atom(atom_name, '*')) {
-                            pi_atoms.push_back(atom);
-                        }
-                    }
-                    if (pi_atoms.size() != ring.atoms.size()) continue;
+                        double avg_pi_occ = 0.0;
+                        for (const gemmi::Atom* atom : pi_atoms) avg_pi_occ += atom->occ;
+                        avg_pi_occ /= static_cast<double>(pi_atoms.size());
+                        if (avg_pi_occ < MIN_ATOM_OCCUPANCY) continue;
 
-                    std::vector<gemmi::Position> ring_positions = collect_positions(pi_atoms);
-                    gemmi::Position pi_center = calculate_center(ring_positions);
-                    gemmi::Position pi_normal = calculate_normal(ring_positions);
-                    double planarity = calculate_planarity_deviation(ring_positions, pi_center, pi_normal);
-                    if (planarity > PLANARITY_CUTOFF) continue;
+                        double pi_b_mean = calculate_mean_b(pi_atoms);
+                        char pi_alt = ring_variant.altloc;
+                        auto candidates = ns.find_atoms(
+                            pi_center, pi_alt, 0.0, DIST_SEARCH_LIMIT);
 
-                    double avg_pi_occ = 0.0;
-                    for (const gemmi::Atom* atom : pi_atoms) avg_pi_occ += atom->occ;
-                    avg_pi_occ /= static_cast<double>(pi_atoms.size());
-                    if (avg_pi_occ < MIN_ATOM_OCCUPANCY) continue;
+                        for (const gemmi::NeighborSearch::Mark* x_mark : candidates) {
+                            if (x_mark->image_idx != 0) continue;
 
-                    double pi_b_mean = calculate_mean_b(pi_atoms);
-                    char pi_alt = pi_atoms.empty() ? '\0' : pi_atoms.front()->altloc;
-                    auto candidates = ns.find_atoms(pi_center, pi_alt, 0.0, DIST_SEARCH_LIMIT);
+                            gemmi::const_CRA x_cra = x_mark->to_cra(model);
+                            if (!x_cra.atom || !x_cra.residue || !x_cra.chain) continue;
+                            if (x_cra.chain == &pi_chain && x_cra.residue == &pi_res) continue;
 
-                    for (const gemmi::NeighborSearch::Mark* x_mark : candidates) {
-                        if (x_mark->image_idx != 0) continue;
+                            const gemmi::Atom& x_atom = *x_cra.atom;
+                            std::string x_elem = element_name_upper(x_atom.element);
+                            if (!is_target_x_element(x_elem)) continue;
+                            if (is_excluded_donor_atom(x_cra.residue->name, x_atom.name)) continue;
+                            if (is_cation_donor(x_cra.residue->name, x_atom.name)) continue;
+                            if (x_atom.occ < MIN_ATOM_OCCUPANCY) continue;
+                            if (!altlocs_compatible(pi_alt, x_atom.altloc)) continue;
+                            if (is_donor_blocked(x_atom, model, ns, x_atom.pos)) continue;
 
-                        gemmi::const_CRA x_cra = x_mark->to_cra(model);
-                        if (!x_cra.atom || !x_cra.residue || !x_cra.chain) continue;
-                        if (x_cra.chain == &pi_chain && x_cra.residue == &pi_res) continue;
+                            gemmi::Position x_pos = x_atom.pos;
+                            double dist_x_pi = calculate_distance(x_pos, pi_center);
+                            double max_dist = get_dynamic_threshold(x_elem);
+                            if (dist_x_pi > max_dist) continue;
 
-                        const gemmi::Atom& x_atom = *x_cra.atom;
-                        std::string x_elem = element_name_upper(x_atom.element);
-                        if (!is_target_x_element(x_elem)) continue;
-                        if (is_excluded_donor_atom(x_cra.residue->name, x_atom.name)) continue;
-                        if (x_atom.occ < MIN_ATOM_OCCUPANCY) continue;
-                        if (pi_alt != '\0' && x_atom.altloc != '\0' && pi_alt != x_atom.altloc) continue;
-                        if (is_donor_blocked(x_atom, model, ns, x_atom.pos)) continue;
+                            double xpcn_angle = calculate_xpcn_angle(pi_normal, x_pos, pi_center);
+                            double proj_dist = calculate_projection_dist(pi_normal, pi_center, x_pos);
+                            if (xpcn_angle < 0.0 || !std::isfinite(proj_dist)) continue;
 
-                        gemmi::Position x_pos = x_atom.pos;
-                        double dist_x_pi = calculate_distance(x_pos, pi_center);
-                        double max_dist = get_dynamic_threshold(x_elem);
-                        if (dist_x_pi > max_dist) continue;
+                            double combined_occ = std::min(
+                                avg_pi_occ, static_cast<double>(x_atom.occ));
+                            int sym_op = 0;
 
-                        double xpcn_angle = calculate_xpcn_angle(pi_normal, x_pos, pi_center);
-                        double proj_dist = calculate_projection_dist(pi_normal, pi_center, x_pos);
-                        if (xpcn_angle < 0.0 || !std::isfinite(proj_dist)) continue;
-
-                        double combined_occ = std::min(avg_pi_occ, static_cast<double>(x_atom.occ));
-                        int sym_op = 0;
-
-                        std::vector<gemmi::Position> orig_h_positions;
-                        bool found_explicit = run_explicit_track(
-                            results, orig_h_positions, structure, model, ns, model_id,
-                            pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
-                            pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
-                            xpcn_angle, proj_dist, combined_occ, sym_op, min_occ, mon_lib_path);
-
-                        if (!found_explicit && use_cone &&
-                            !is_cone_scan_suppressed(x_cra.residue->name, x_atom.name)) {
-                            run_cone_track(
+                            std::vector<gemmi::Position> orig_h_positions;
+                            bool found_explicit = run_explicit_track(
                                 results, orig_h_positions, structure, model, ns, model_id,
                                 pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
                                 pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
-                                xpcn_angle, proj_dist, combined_occ, sym_op, min_occ,
-                                generate_missing_h_cone, mon_lib_path);
+                                xpcn_angle, proj_dist, combined_occ, sym_op, min_occ, mon_lib_path);
+
+                            if (!found_explicit && use_cone &&
+                                !is_cone_scan_suppressed(x_cra.residue->name, x_atom.name)) {
+                                run_cone_track(
+                                    results, orig_h_positions, structure, model, ns, model_id,
+                                    pi_chain, pi_res, ring, static_cast<int>(ring_idx), pi_center, pi_normal,
+                                    pi_b_mean, avg_pi_occ, x_cra, x_atom, x_pos, dist_x_pi, max_dist,
+                                    xpcn_angle, proj_dist, combined_occ, sym_op, min_occ,
+                                    generate_missing_h_cone, mon_lib_path);
+                            }
                         }
                     }
                 }

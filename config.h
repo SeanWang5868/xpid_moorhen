@@ -8,7 +8,6 @@
 namespace xhpi {
 
 inline constexpr double DIST_SEARCH_LIMIT = 6.0;
-inline constexpr double DIST_CUTOFF_H = 1.3;
 inline constexpr double MIN_COVALENT_XH = 0.5;
 inline constexpr double METAL_BLOCKING_RADIUS = 2.6;
 inline constexpr double PLANARITY_CUTOFF = 0.5;
@@ -29,15 +28,8 @@ inline const std::unordered_map<std::string, std::vector<std::vector<std::string
         {"CD1", "CD2", "NE1", "CG", "CE2"}
     }},
     {"TYR", {{"CD1", "CD2", "CE1", "CE2", "CZ", "CG"}}},
-    {"PTR", {{"CD1", "CD2", "CE1", "CE2", "CZ", "CG"}}},
     {"PHE", {{"CD1", "CD2", "CE1", "CE2", "CZ", "CG"}}},
-    {"HIS", {{"CE1", "ND1", "NE2", "CG", "CD2"}}},
-    {"BER", {
-        {"C1", "N1", "C3", "C6", "C8", "C12"},
-        {"C8", "C12", "C13", "C15", "C16", "C18"},
-        {"C2", "C4", "C5", "C9", "C11", "C14"}
-    }},
-    {"4PO", {{"N2", "C6", "C7", "C8", "C9", "C10"}}}
+    {"HIS", {{"CE1", "ND1", "NE2", "CG", "CD2"}}}
 };
 
 inline const std::unordered_map<std::string, std::unordered_map<std::string, std::string>> ROTATABLE_MAPPING = {
@@ -64,6 +56,13 @@ inline const std::unordered_map<std::string, double> BOND_LENGTHS = {
     {"S", 1.33}
 };
 
+inline const std::unordered_map<std::string, double> COVALENT_XH_MAX = {
+    {"C", 1.25},
+    {"N", 1.25},
+    {"O", 1.20},
+    {"S", 1.55}
+};
+
 inline const std::unordered_set<std::string> CATION_DONORS = {
     "LYS:NZ",
     "ARG:NH1",
@@ -85,6 +84,11 @@ inline double get_dynamic_threshold(const std::string& elem) {
 inline double get_bond_length(const std::string& elem) {
     auto it = BOND_LENGTHS.find(elem);
     return it == BOND_LENGTHS.end() ? 1.09 : it->second;
+}
+
+inline double get_covalent_xh_max(const std::string& elem) {
+    auto it = COVALENT_XH_MAX.find(elem);
+    return it == COVALENT_XH_MAX.end() ? 0.0 : it->second;
 }
 
 inline std::string get_cone_parent_atom(const std::string& res_name, const std::string& atom_name) {

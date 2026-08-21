@@ -129,25 +129,59 @@ inline std::vector<AromaticRing> rings_from_fallback(const std::string& res_uppe
     return rings;
 }
 
+inline std::vector<std::string> canonical_cycle(const std::vector<std::string>& cycle) {
+    std::vector<std::string> best;
+    for (int reverse = 0; reverse < 2; ++reverse) {
+        std::vector<std::string> ordered = cycle;
+        if (reverse != 0) std::reverse(ordered.begin(), ordered.end());
+        for (size_t offset = 0; offset < ordered.size(); ++offset) {
+            std::vector<std::string> candidate;
+            candidate.reserve(ordered.size());
+            for (size_t i = 0; i < ordered.size(); ++i) {
+                candidate.push_back(ordered[(offset + i) % ordered.size()]);
+            }
+            if (best.empty() || candidate < best) best = std::move(candidate);
+        }
+    }
+    return best;
+}
+
+inline bool is_chordless_cycle(const std::vector<std::string>& cycle,
+                               const std::map<std::string, std::set<std::string>>& graph) {
+    for (size_t i = 0; i < cycle.size(); ++i) {
+        const std::string& atom = cycle[i];
+        const std::string& previous = cycle[(i + cycle.size() - 1) % cycle.size()];
+        const std::string& next = cycle[(i + 1) % cycle.size()];
+        auto graph_it = graph.find(atom);
+        if (graph_it == graph.end()) return false;
+        for (const std::string& other : cycle) {
+            if (other != atom && other != previous && other != next &&
+                graph_it->second.count(other) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 inline void dfs_aromatic_cycles(const std::map<std::string, std::set<std::string>>& graph,
                                 const std::string& start,
                                 std::vector<std::string>& path,
-                                std::set<std::vector<std::string>>& found,
-                                int& visits) {
-    if (++visits > 500) return;
-    if (path.size() > 8) return;
+                                std::set<std::vector<std::string>>& found) {
+    if (path.size() > 6) return;
 
     auto graph_it = graph.find(path.back());
     if (graph_it == graph.end()) return;
 
     for (const std::string& nb : graph_it->second) {
         if (nb == start && (path.size() == 5 || path.size() == 6)) {
-            std::vector<std::string> cycle = path;
-            std::sort(cycle.begin(), cycle.end());
-            found.insert(std::move(cycle));
-        } else if (std::find(path.begin(), path.end(), nb) == path.end()) {
+            if (is_chordless_cycle(path, graph)) {
+                found.insert(canonical_cycle(path));
+            }
+        } else if (path.size() < 6 &&
+                   std::find(path.begin(), path.end(), nb) == path.end()) {
             path.push_back(nb);
-            dfs_aromatic_cycles(graph, start, path, found, visits);
+            dfs_aromatic_cycles(graph, start, path, found);
             path.pop_back();
         }
     }
@@ -156,13 +190,19 @@ inline void dfs_aromatic_cycles(const std::map<std::string, std::set<std::string
 inline void find_cycles_in_graph(const std::map<std::string, std::set<std::string>>& graph,
                                  std::vector<std::vector<std::string>>& cycles) {
     std::set<std::vector<std::string>> found_cycles;
-    int visits = 0;
     for (const auto& item : graph) {
         std::vector<std::string> path = {item.first};
-        dfs_aromatic_cycles(graph, item.first, path, found_cycles, visits);
-        if (visits > 500) break;
+        dfs_aromatic_cycles(graph, item.first, path, found_cycles);
     }
     cycles.assign(found_cycles.begin(), found_cycles.end());
+    std::sort(cycles.begin(), cycles.end(), [](const auto& left, const auto& right) {
+        if (left.size() != right.size()) return left.size() < right.size();
+        std::vector<std::string> left_atoms = left;
+        std::vector<std::string> right_atoms = right;
+        std::sort(left_atoms.begin(), left_atoms.end());
+        std::sort(right_atoms.begin(), right_atoms.end());
+        return left_atoms < right_atoms;
+    });
 }
 
 inline bool is_standard_polymer_residue(const std::string& res_upper) {
@@ -176,6 +216,7 @@ inline bool is_standard_polymer_residue(const std::string& res_upper) {
 
 inline MonomerTopology build_monomer_topology(const std::string& res_upper,
                                               const gemmi::ChemComp& cc) {
+    (void) res_upper;
     MonomerTopology topology;
     std::unordered_set<std::string> seen;
 
@@ -241,6 +282,37 @@ inline MonomerTopology read_monomer_topology(const std::string& res_upper,
     return build_monomer_topology(res_upper, cc);
 }
 
+inline bool standard_rings_are_complete(const std::string& res_upper,
+                                        const std::vector<AromaticRing>& rings) {
+    auto fallback_it = FALLBACK_RINGS.find(res_upper);
+    if (fallback_it == FALLBACK_RINGS.end()) return true;
+
+    std::set<std::string> expected;
+    std::set<std::string> observed;
+    for (const auto& atom_names : fallback_it->second) expected.insert(ring_key(atom_names));
+    for (const AromaticRing& ring : rings) observed.insert(ring_key(ring.atoms));
+    return expected == observed;
+}
+
+inline void order_standard_rings(const std::string& res_upper,
+                                 std::vector<AromaticRing>& rings) {
+    auto fallback_it = FALLBACK_RINGS.find(res_upper);
+    if (fallback_it == FALLBACK_RINGS.end()) return;
+
+    std::unordered_map<std::string, size_t> rank;
+    for (size_t i = 0; i < fallback_it->second.size(); ++i) {
+        rank[ring_key(fallback_it->second[i])] = i;
+    }
+    std::stable_sort(rings.begin(), rings.end(), [&](const AromaticRing& left,
+                                                     const AromaticRing& right) {
+        size_t left_rank = rank.count(ring_key(left.atoms)) != 0
+            ? rank.at(ring_key(left.atoms)) : rank.size();
+        size_t right_rank = rank.count(ring_key(right.atoms)) != 0
+            ? rank.at(ring_key(right.atoms)) : rank.size();
+        return left_rank < right_rank;
+    });
+}
+
 inline const MonomerTopology& get_monomer_topology(const std::string& res_name,
                                                    const std::string& mon_lib_path = "") {
     static std::unordered_map<std::string, MonomerTopology> cache;
@@ -268,8 +340,10 @@ inline const MonomerTopology& get_monomer_topology(const std::string& res_name,
         }
     }
 
-    if (topology.rings.empty()) {
+    if (!standard_rings_are_complete(res_upper, topology.rings)) {
         topology.rings = rings_from_fallback(res_upper);
+    } else {
+        order_standard_rings(res_upper, topology.rings);
     }
 
     auto inserted = cache.emplace(cache_key, std::move(topology));
