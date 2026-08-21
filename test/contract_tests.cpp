@@ -6,9 +6,11 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "core.h"
+#include "cone.h"
 
 namespace {
 
@@ -246,6 +248,53 @@ void test_sulfur_deuterium_uses_element_specific_cutoff() {
             "deuterium name must canonicalize to dictionary hydrogen name");
 }
 
+void test_group_specific_single_hydrogen_geometry() {
+    const gemmi::Position parent(0.0, 0.0, 0.0);
+    const gemmi::Position x_pos(1.42, 0.0, 0.0);
+    for (const auto& expected : std::vector<std::tuple<std::string, std::string, double, double>>{
+             {"SER", "OG", 0.972, 108.539},
+             {"CYS", "SG", 1.338, 97.543}}) {
+        const auto* definition = xhpi::get_rotatable_group_definition(
+            std::get<0>(expected), std::get<1>(expected));
+        require(definition != nullptr, "rotatable single-H definition missing");
+        auto conformers = xhpi::generate_group_conformers(parent, x_pos, *definition);
+        require(conformers.size() == 360, "single-H group requires a full 360 degree scan");
+        require(conformers.front().hydrogen_positions.size() == 1,
+                "single-H group generated the wrong hydrogen count");
+        const gemmi::Position& h_pos = conformers.front().hydrogen_positions.front();
+        require(std::abs(h_pos.dist(x_pos) - std::get<2>(expected)) < 1e-10,
+                "group-specific X-H nuclear distance changed");
+        const double angle = xhpi::calculate_angle_vectors(parent - x_pos, h_pos - x_pos);
+        require(std::abs(angle - std::get<3>(expected)) < 1e-10,
+                "group-specific parent-X-H angle changed");
+    }
+}
+
+void test_methyl_conformer_contains_three_coupled_hydrogens() {
+    const auto* definition = xhpi::get_rotatable_group_definition("ALA", "CB");
+    require(definition != nullptr, "ALA methyl definition missing");
+    const gemmi::Position parent(0.0, 0.0, 0.0);
+    const gemmi::Position x_pos(1.53, 0.0, 0.0);
+    auto conformers = xhpi::generate_group_conformers(parent, x_pos, *definition);
+    require(conformers.size() == 120, "methyl symmetry requires one 120 degree period");
+    require(conformers.front().hydrogen_positions.size() == 3,
+            "a methyl conformer must contain all three hydrogens");
+
+    const auto& hydrogens = conformers.front().hydrogen_positions;
+    for (const gemmi::Position& h_pos : hydrogens) {
+        require(std::abs(h_pos.dist(x_pos) - 1.092) < 1e-10,
+                "methyl C-H nuclear distance changed");
+        const double angle = xhpi::calculate_angle_vectors(parent - x_pos, h_pos - x_pos);
+        require(std::abs(angle - 109.742) < 1e-10,
+                "methyl parent-C-H angle changed");
+    }
+    require(std::abs(hydrogens[0].dist(hydrogens[1]) -
+                     hydrogens[1].dist(hydrogens[2])) < 1e-10,
+            "methyl hydrogens are not rotationally coupled");
+    require(xhpi::get_rotatable_group_definition("LYS", "NZ") == nullptr,
+            "cationic LYS NZ must not enter the XH-pi cone model");
+}
+
 }  // namespace
 
 int main() {
@@ -258,6 +307,8 @@ int main() {
     run_test("ambiguous hydrogen ownership", test_unknown_component_rejects_ambiguous_hydrogen_owner);
     run_test("dictionary hydrogen ownership", test_dictionary_bonds_are_authoritative_for_explicit_hydrogens);
     run_test("sulfur-deuterium cutoff", test_sulfur_deuterium_uses_element_specific_cutoff);
+    run_test("group-specific single-H geometry", test_group_specific_single_hydrogen_geometry);
+    run_test("coupled methyl geometry", test_methyl_conformer_contains_three_coupled_hydrogens);
 
     if (failures != 0) {
         std::cerr << failures << " contract test(s) failed\n";
